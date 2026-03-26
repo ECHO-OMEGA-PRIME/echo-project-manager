@@ -42,9 +42,56 @@ function requireBody(body: unknown, ...fields: string[]): string | null {
 }
 
 function parsePagination(url: URL): { limit: number; offset: number } {
-  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '50', 10), 1), 200);
-  const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10), 0);
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0);
   return { limit, offset };
+}
+
+// ---------------------------------------------------------------------------
+// Rate Limiting (KV-based sliding window)
+// ---------------------------------------------------------------------------
+
+interface RLState { c: number; t: number }
+
+async function checkRateLimit(kv: KVNamespace, key: string, limit: number, windowSec: number): Promise<{ allowed: boolean; remaining: number; reset: number }> {
+  const rlKey = `rl:${key}`;
+  const now = Math.floor(Date.now() / 1000);
+  const raw = await kv.get(rlKey, 'json') as RLState | null;
+
+  let count: number;
+  let windowStart: number;
+
+  if (!raw || (now - raw.t) >= windowSec) {
+    count = 1;
+    windowStart = now;
+  } else {
+    const elapsed = now - raw.t;
+    const decay = Math.max(0, 1 - elapsed / windowSec);
+    count = Math.floor(raw.c * decay) + 1;
+    windowStart = raw.t;
+  }
+
+  const allowed = count <= limit;
+  await kv.put(rlKey, JSON.stringify({ c: count, t: windowStart } as RLState), { expirationTtl: windowSec * 2 });
+
+  return { allowed, remaining: Math.max(0, limit - count), reset: windowSec - (now - windowStart) };
+}
+
+// ---------------------------------------------------------------------------
+// Input Sanitization
+// ---------------------------------------------------------------------------
+
+function sanitize(input: string, maxLen = 2000): string {
+  if (typeof input !== 'string') return '';
+  return input.slice(0, maxLen).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+}
+
+function sanitizeBody<T extends Record<string, unknown>>(body: T, maxLen = 2000): T {
+  const clean = { ...body };
+  for (const [k, v] of Object.entries(clean)) {
+    if (typeof v === 'string') (clean as Record<string, unknown>)[k] = sanitize(v, maxLen);
+  }
+  return clean;
 }
 
 function parseJson(raw: string | null, fallback: unknown = null): unknown {
@@ -72,6 +119,25 @@ app.use('*', cors({
   allowHeaders: ['Content-Type', 'Authorization', 'X-Echo-API-Key'],
   maxAge: 86400,
 }));
+
+// Rate limiting middleware — 60 req/min per IP for writes, 200 req/min for reads
+app.use('*', async (c, next) => {
+  const path = new URL(c.req.url).pathname;
+  if (path === '/health' || path === '/' || path === '/status') return next();
+  const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown';
+  const isWrite = ['POST', 'PUT', 'DELETE'].includes(c.req.method);
+  const limit = isWrite ? 60 : 200;
+  const rlKey = `pm:${ip}:${isWrite ? 'w' : 'r'}`;
+  const { allowed, remaining, reset } = await checkRateLimit(c.env.CACHE, rlKey, limit, 60);
+  c.header('X-RateLimit-Limit', String(limit));
+  c.header('X-RateLimit-Remaining', String(remaining));
+  c.header('X-RateLimit-Reset', String(reset));
+  if (!allowed) {
+    log('warn', 'Rate limited', { ip, path, method: c.req.method });
+    return c.json({ ok: false, error: 'Rate limit exceeded. Try again shortly.' }, 429);
+  }
+  return next();
+});
 
 // =========================================================================
 // HEALTH & STATUS
