@@ -1,0 +1,24 @@
+name = "echo-project-manager"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-project-manager"
+database_id = "1b961c5c-b962-4673-ad5d-66090cbfb1a3"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "386ed606ae4d47f99f3a6bc596e429b9"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[triggers]
+crons = ["0 9 * * MON"]
