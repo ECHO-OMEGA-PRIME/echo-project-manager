@@ -10,6 +10,7 @@ interface Env {
   CACHE: KVNamespace;
   ENGINE_RUNTIME: Fetcher;
   SHARED_BRAIN: Fetcher;
+  ECHO_API_KEY?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +136,20 @@ app.use('*', async (c, next) => {
   if (!allowed) {
     log('warn', 'Rate limited', { ip, path, method: c.req.method });
     return c.json({ ok: false, error: 'Rate limit exceeded. Try again shortly.' }, 429);
+  }
+  return next();
+});
+
+// ── Auth Middleware — writes require API key ─────────────────────
+app.use('*', async (c, next) => {
+  const method = c.req.method;
+  const path = new URL(c.req.url).pathname;
+  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status') return next();
+  const apiKey = c.req.header('X-Echo-API-Key') || '';
+  const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
+  const expected = c.env.ECHO_API_KEY;
+  if (!expected || (apiKey !== expected && bearer !== expected)) {
+    return c.json({ ok: false, error: 'Unauthorized — X-Echo-API-Key or Bearer token required' }, 401);
   }
   return next();
 });
