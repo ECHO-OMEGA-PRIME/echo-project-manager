@@ -22,3 +22,7 @@ service = "echo-shared-brain"
 
 [triggers]
 crons = ["0 9 * * MON"]
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "echo_metrics"
