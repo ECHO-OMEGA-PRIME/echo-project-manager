@@ -114,6 +114,16 @@ async function logActivity(db: D1Database, workspaceId: string, action: string, 
 
 const app = new Hono<{ Bindings: Env }>();
 
+// Security headers middleware
+app.use('*', async (c, next) => {
+  await next();
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('X-Frame-Options', 'DENY');
+  c.header('X-XSS-Protection', '1; mode=block');
+  c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+  c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+});
+
 app.use('*', cors({
   origin: ['https://echo-ept.com', 'https://www.echo-ept.com', 'https://echo-op.com', 'http://localhost:3000'],
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
