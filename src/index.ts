@@ -11,6 +11,9 @@ interface Env {
   ENGINE_RUNTIME: Fetcher;
   SHARED_BRAIN: Fetcher;
   ECHO_API_KEY?: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  ANALYTICS: AnalyticsEngineDataset;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +138,7 @@ app.use('*', cors({
 // Rate limiting middleware — 60 req/min per IP for writes, 200 req/min for reads
 app.use('*', async (c, next) => {
   const path = new URL(c.req.url).pathname;
-  if (path === '/health' || path === '/' || path === '/status') return next();
+  if (path === '/health' || path === '/' || path === '/status' || path === '/webhooks/stripe' || path === '/plans') return next();
   const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown';
   const isWrite = ['POST', 'PUT', 'DELETE'].includes(c.req.method);
   const limit = isWrite ? 60 : 200;
@@ -155,7 +158,7 @@ app.use('*', async (c, next) => {
 app.use('*', async (c, next) => {
   const method = c.req.method;
   const path = new URL(c.req.url).pathname;
-  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status') return next();
+  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status' || path === '/webhooks/stripe') return next();
   const apiKey = c.req.header('X-Echo-API-Key') || '';
   const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
   const expected = c.env.ECHO_API_KEY;
@@ -169,12 +172,12 @@ app.use('*', async (c, next) => {
 // HEALTH & STATUS
 // =========================================================================
 
-app.get('/', (c) => c.json({ service: 'echo-project-manager', version: '1.0.0', status: 'operational' }));
+app.get('/', (c) => c.json({ service: 'echo-project-manager', version: '2.0.0', status: 'operational' }));
 
 app.get('/health', async (c) => {
   let dbOk = false;
   try { const r = await c.env.DB.prepare("SELECT 1 AS ping").first(); dbOk = r?.ping === 1; } catch { /* */ }
-  return ok({ service: 'echo-project-manager', version: '1.0.0', d1: dbOk ? 'connected' : 'offline', ts: new Date().toISOString() });
+  return ok({ service: 'echo-project-manager', version: '2.0.0', d1: dbOk ? 'connected' : 'offline', stripe: !!c.env.STRIPE_SECRET_KEY, ts: new Date().toISOString() });
 });
 
 app.get('/status', async (c) => {
@@ -1002,6 +1005,149 @@ async function handleScheduled(event: ScheduledEvent, env: Env): Promise<void> {
     }
   }
 }
+
+// =========================================================================
+// STRIPE PAYMENT INTEGRATION
+// =========================================================================
+
+const PM_PLANS = [
+  { id: 'free', name: 'Free', price: 0, max_projects: 3, max_members: 5, max_tasks: 100, display: 'Free' },
+  { id: 'team', name: 'Team', price: 4999, max_projects: 20, max_members: 25, max_tasks: 5000, display: '$49.99/mo' },
+  { id: 'business', name: 'Business', price: 14999, max_projects: 100, max_members: 100, max_tasks: 50000, display: '$149.99/mo' },
+  { id: 'enterprise', name: 'Enterprise', price: 39999, max_projects: -1, max_members: -1, max_tasks: -1, display: '$399.99/mo' },
+] as const;
+
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  const parts: Record<string, string> = {};
+  for (const p of sigHeader.split(',')) {
+    const eq = p.indexOf('=');
+    if (eq > 0) parts[p.slice(0, eq).trim()] = p.slice(eq + 1).trim();
+  }
+  const ts = parts['t'];
+  const v1 = parts['v1'];
+  if (!ts || !v1) return false;
+  if (Math.abs(Date.now() / 1000 - parseInt(ts)) > 300) return false;
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${ts}.${payload}`));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expected.length !== v1.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ v1.charCodeAt(i);
+  return diff === 0;
+}
+
+app.post('/webhooks/stripe', async (c) => {
+  const secret = c.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret) return c.json({ ok: false, error: 'Stripe not configured' }, 503);
+
+  const body = await c.req.text();
+  const sig = c.req.header('Stripe-Signature') || '';
+  if (!await verifyStripeSignature(body, sig, secret)) {
+    log('warn', 'Stripe webhook signature verification failed');
+    return c.json({ ok: false, error: 'Invalid signature' }, 401);
+  }
+
+  const event = JSON.parse(body);
+  log('info', 'Stripe webhook received', { type: event.type, id: event.id });
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const workspaceId = session.metadata?.workspace_id;
+    const planId = session.metadata?.plan;
+    if (workspaceId && planId) {
+      const plan = PM_PLANS.find(p => p.id === planId);
+      if (plan) {
+        await c.env.DB.prepare(
+          `UPDATE workspaces SET plan=?1, max_projects=?2, max_members=?3, stripe_customer_id=?4, stripe_subscription_id=?5, updated_at=?6 WHERE id=?7`
+        ).bind(planId, plan.max_projects, plan.max_members, session.customer, session.subscription, nowISO(), workspaceId).run();
+        log('info', 'Workspace plan upgraded', { workspace_id: workspaceId, plan: planId });
+      }
+    }
+  } else if (event.type === 'customer.subscription.deleted') {
+    const sub = event.data.object;
+    const free = PM_PLANS[0];
+    await c.env.DB.prepare(
+      `UPDATE workspaces SET plan='free', max_projects=?1, max_members=?2, stripe_subscription_id=NULL, updated_at=?3 WHERE stripe_subscription_id=?4`
+    ).bind(free.max_projects, free.max_members, nowISO(), sub.id).run();
+    log('info', 'Workspace downgraded to free', { subscription: sub.id });
+  }
+
+  try {
+    c.env.ANALYTICS?.writeDataPoint({
+      blobs: ['stripe_webhook', event.type, ''],
+      doubles: [(event.data?.object?.amount_total || 0) / 100],
+      indexes: ['echo-project-manager'],
+    });
+  } catch (_) {}
+
+  return c.json({ ok: true, received: true });
+});
+
+app.get('/plans', (c) => c.json({ ok: true, data: PM_PLANS }));
+
+app.post('/plans/upgrade', async (c) => {
+  const stripeKey = c.env.STRIPE_SECRET_KEY;
+  if (!stripeKey) return fail('Payments not configured', 503);
+
+  const body = await c.req.json() as any;
+  const err = requireBody(body, 'workspace_id', 'plan');
+  if (err) return fail(err);
+
+  const target = PM_PLANS.find(p => p.id === body.plan);
+  if (!target || target.price === 0) return fail('Invalid plan');
+
+  const ws = await c.env.DB.prepare('SELECT * FROM workspaces WHERE id=?').bind(body.workspace_id).first<any>();
+  if (!ws) return fail('Workspace not found', 404);
+
+  const params = new URLSearchParams();
+  params.append('mode', 'subscription');
+  params.append('payment_method_types[0]', 'card');
+  params.append('line_items[0][price_data][currency]', 'usd');
+  params.append('line_items[0][price_data][product_data][name]', `Echo Project Manager — ${target.name}`);
+  params.append('line_items[0][price_data][product_data][description]', `Up to ${target.max_projects === -1 ? 'unlimited' : target.max_projects} projects, ${target.max_members === -1 ? 'unlimited' : target.max_members} members`);
+  params.append('line_items[0][price_data][unit_amount]', String(target.price));
+  params.append('line_items[0][price_data][recurring][interval]', 'month');
+  params.append('line_items[0][quantity]', '1');
+  params.append('success_url', body.success_url || 'https://echo-prime-tech.com/project-manager?upgraded=true');
+  params.append('cancel_url', body.cancel_url || 'https://echo-prime-tech.com/project-manager/pricing');
+  params.append('metadata[workspace_id]', body.workspace_id);
+  params.append('metadata[plan]', body.plan);
+  params.append('metadata[workspace_name]', ws.name || '');
+
+  const resp = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${stripeKey}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString(),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    log('error', 'Stripe checkout failed', { status: resp.status, error: errText });
+    return fail('Payment service error', 502);
+  }
+
+  const session = await resp.json() as any;
+  return ok({ checkout_url: session.url, session_id: session.id });
+});
+
+app.post('/admin/migrate-stripe', async (c) => {
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare("ALTER TABLE workspaces ADD COLUMN stripe_customer_id TEXT"),
+      c.env.DB.prepare("ALTER TABLE workspaces ADD COLUMN stripe_subscription_id TEXT"),
+      c.env.DB.prepare("ALTER TABLE workspaces ADD COLUMN plan TEXT DEFAULT 'free'"),
+      c.env.DB.prepare("ALTER TABLE workspaces ADD COLUMN max_projects INTEGER DEFAULT 3"),
+      c.env.DB.prepare("ALTER TABLE workspaces ADD COLUMN max_members INTEGER DEFAULT 5"),
+      c.env.DB.prepare("ALTER TABLE workspaces ADD COLUMN plan_expires_at TEXT"),
+    ]);
+    return ok({ message: 'Stripe columns added' });
+  } catch (e: any) {
+    return ok({ message: 'Columns may already exist', detail: e.message });
+  }
+});
 
 // =========================================================================
 // 404 & ERROR
